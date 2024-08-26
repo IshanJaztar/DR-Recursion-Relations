@@ -1,0 +1,293 @@
+import time
+from itertools import product, combinations_with_replacement, permutations
+from sage.all import var, PolynomialRing, QQ, prod
+import numpy as np
+from collections.abc import Iterable
+from collections import Counter
+%pip install more-itertools
+%pip install --upgrade pip
+from more_itertools import distinct_permutations as idp
+
+
+
+
+# Parameters to specify to determine level of accuracy:
+deg_diff = 10      # number of u_i variables to simulate, u_0, u_1,..., u_(deg_diff - 1)
+
+# Create a polynomial ring QQ[c][u,e] over the ring QQ[c] over QQ.
+u = [var(f'u_{i}') for i in range(deg_diff)]
+c = [var(f'c_{i}') for i in range(100)]
+e = [var(f'e')]
+v = e + u 
+
+H = PolynomialRing(QQ, c)
+L = PolynomialRing(H, v)
+
+c = L.base_ring().gens()
+v = L.gens()
+
+# Define the operator partial_x 
+def del_x(f,deg_diff):
+    return  sum(v[k+1]*diff(f,v[k]) for k in range(1,deg_diff) )
+
+# Define the counting operator D-1
+def Count(f, deg_diff):
+    return sum(k*v[k]*diff(f,v[k]) for k in range(1,deg_diff+1)) - f
+
+# Define the operator partial_x acted on k-times
+def del_x_k(f,k,deg_diff):
+    result = f
+    for _ in range(k):
+        result = del_x(result,deg_diff)
+    return result
+
+# Define the variational derivative of a local functional f_bar
+def var_der(f, deg_diff):
+    return sum((-1)^(k-1)*del_x_k((diff(f,v[k])),k-1,deg_diff)  for k in range(1,deg_diff))
+
+# Define the bracket {f,g} of a local function g and differential polynomial f
+def bracket(f, g, deg_diff):
+    return sum(diff(f, v[k]) * del_x_k(var_der(g, deg_diff), k, deg_diff) for k in range(1, deg_diff))
+
+# Function to find the index of the last non-zero element in a list
+def last_non_zero_index(lst):
+    for i in range(len(lst) - 1, -1, -1):
+        if lst[i] != 0:
+            return i
+    return None
+
+# Function to split lists p into m number of list partitions of almost equal size
+def split_list_into_partitions(p, m):
+    # Calculate the size of each partition and the remainder
+    partition_size = len(p) // m
+    remainder = len(p) % m
+
+    # Initialize an empty list to store partitions
+    partitions = []
+
+    # Split the list into partitions
+    start_index = 0
+    for i in range(m):
+        partition_length = partition_size + (1 if i < remainder else 0)  # Adjust partition length for the remainder
+        partitions.append(p[start_index:start_index + partition_length])
+        start_index += partition_length
+
+    return partitions
+
+# Construct the recursion relations for KdV
+# del_x(D-1)g_{i+1} = {g_i,h_bar}
+def recursion_rel(h,g_initial,g_0, deg_diff):
+
+    eqs = del_x(Count(g_0,deg_diff),deg_diff) - bracket(g_initial, h,deg_diff)  
+ 
+    q = g_0.coefficients()
+    R = PolynomialRing(QQ, q)
+    q = R.gens()
+    
+    I = R.ideal(eqs.coefficients())
+    solutions = I.variety()  
+    solutions_dict = dict(solutions[0])
+    
+    g_0_sym = SR(g_0)
+    g_0 = L(g_0_sym.subs(solutions_dict))
+    return g_0
+
+def groebner_basis(h, g_initial, g_0, variables, coefficients, deg_diff):
+    eqs = del_x(Count(g_0, deg_diff), deg_diff) - bracket(g_initial, h, deg_diff)
+
+    q = g_0.coefficients()
+    R = PolynomialRing(QQ, q)
+    q = R.gens()
+    
+    I = R.ideal(eqs.coefficients())
+    groebner_basis_list = list(I.groebner_basis(algorithm='singular:std'))
+    
+    # Loop to plit the list of equations into m partitions:
+    m = 1
+    
+    while True:
+        try:
+            eqs_partitions = split_list_into_partitions(groebner_basis_list, m)
+
+            solutions = {}
+            for eqs_part in eqs_partitions:
+                # Extract variables from each polynomial in the partition
+                variables = [polynomial.variables() for polynomial in eqs_part]
+
+                # Flatten the list of variables
+                q = [var for sublist in variables for var in sublist]
+
+                # Create the polynomial ring
+                R = PolynomialRing(QQ, q)
+
+                # Compute the ideal and variety for the partition
+                I = R.ideal(eqs_part)
+                solutions.update(dict(I.variety()[0]))
+            break
+        except Exception as e:
+            #print(f"Error occurred: {e}. Retrying with m = {m * 2}...")
+            m = m*2
+            if m > 1000:  # Maximum retry limit to prevent infinite loop
+                raise RuntimeError("Maximum retry limit reached")
+
+    g_0_sym = SR(g_0)
+    g_0 = L(g_0_sym.subs(solutions))
+    return g_0
+
+# Obtains suitable polynomial with arbitrary coefficients to be used in the recursion relations
+def reconstruct_polynomial(original_poly, variables, coefficients, deg_diff):
+    # Step 1: Determine the signature of each monomial
+
+    signatures = []
+    for monomial in original_poly.monomials():
+        diff_sig = [monomial.degree(var) for i, var in enumerate(variables[1:], start=1)]
+        v0_degree = monomial.degree(variables[0])
+        monomial_degree = sum(monomial.degree(var) for var in variables) - v0_degree
+        diff_degree = sum(monomial.degree(var) * (i - 1) for i, var in enumerate(variables[2:], start=2)) - 1
+        if diff_degree > -1:
+            signatures.append((diff_sig, v0_degree, monomial_degree, diff_degree))
+        else:
+            signatures.append((0, 0, 0, 0))
+
+    # Step 2: Build a polynomial based on the signatures
+    min_monomial_degree = min(sig[2] for sig in signatures) 
+    max_monomial_degree = max(sig[2] for sig in signatures)
+    min_sig3 = min(sig[3] for sig in signatures)
+    max_diff_degree = max(last_non_zero_index(sig[0]) if isinstance(sig[0], list) else -1 for sig in signatures) + 1 
+    
+    # Create a list of variables
+    c = coefficients
+    v = variables
+    H = PolynomialRing(QQ, c)
+    L = PolynomialRing(H, v)
+
+    c = L.base_ring().gens()
+    v = L.gens()
+    
+    # Initialize the new polynomial with zero
+    new_poly = L(0)
+
+    # Set to store visited indices
+    visited_indices_set = set()
+    visited_comb_indices_set = set()
+    
+    # Generate terms based on the signature
+    terms = []
+    j = 0
+    count1 = 0
+    count2 = 0
+    count3 = 0
+    
+    y = range(max_monomial_degree + 1)
+    
+    
+    comb_indices = list(combinations_with_replacement(y, max_diff_degree))
+    
+    sum_indices =  list(map(sum, comb_indices))
+    
+    
+    sum_key = [i for i,x in enumerate(sum_indices) if min_monomial_degree <= x <= max_monomial_degree]
+    
+    
+    comb_indices = list( comb_indices[i] for i in sum_key)
+    
+    
+    sig0 = [item[0] for item in signatures]
+    sig1 = [item[1] for item in signatures]
+    sig2 = [item[2] for item in signatures]
+    sig3 = [item[3] for item in signatures]
+    unique_key_sig2 = list(Counter(sig2).keys())
+    
+    range_for_sum = range(max_diff_degree)
+    for unique in range(len(unique_key_sig2)):
+        #count1+= 1
+        for indices in comb_indices:
+            
+            if sum(indices)==unique_key_sig2[unique]:
+                
+                perm_indices = list(idp(indices))
+                for z in range(len(sig1)):
+                    
+                    if sig2[z] == unique_key_sig2[unique]:
+                        if j < len(c) and c[j] !=0:
+                            if isinstance(sig0[z], Iterable):
+                                
+                                sig0_trimmed = sig0[z][0:max_diff_degree]
+                                list_largest_key = np.argsort(np.array(sig0_trimmed))[::-1][:3]
+                                key_index1 = list_largest_key[0]
+                                key_index2 = list_largest_key[1]
+                                for g in range(sig1[z] + 1):
+                                    if g == sig1[z]:
+                                        
+                                        perm_indices_placeholder = list( perm_indices[i] for i in range(len(perm_indices)) if abs(perm_indices[i][key_index1]-sig0_trimmed[key_index1])<=1 and abs(perm_indices[i][key_index2]-sig0_trimmed[key_index2])<=1)
+                                        
+                                        multiply = [sum(i * j for i, j in enumerate(sublist)) for sublist in perm_indices_placeholder]
+                                        key_index = [i for i,x in enumerate(multiply) if x==sig3[z]]
+                                        perm_indices_placeholder = list( perm_indices_placeholder[i] for i in key_index)
+                                        
+                                        for indices_2 in perm_indices_placeholder:
+                                        #for indices_2 in perm_indices:
+                                            
+                                            if all(abs(a - b) <= 1 for a, b in zip(indices_2, sig0[z])):
+                                                if not (g, indices_2) in visited_indices_set:
+                                                    
+                                                    visited_indices_set.add((g, indices_2))
+                                                    mon_indices = [g] + list(indices_2)
+                                                    term = c[j] * prod([v[i] ** index for i, index in enumerate(mon_indices)])
+                                                    j += 1
+                                                    terms.append(term)
+                  
+                    
+                
+    # Add the terms to the new polynomial
+    new_poly += sum(terms)
+    #print(count1)
+    #print(count2)
+    #print(count3)
+    # Return the new polynomial
+    return new_poly
+
+
+
+# Example usage:
+# Parameters to specify to determine level of accuracy:
+deg_diff = 14    # Number of u_i variables to simulate, u_0, u_1,..., u_(deg_diff - 1)
+
+# Create a polynomial ring QQ[c][u,e] over the ring QQ[c] over QQ.
+u = [var(f'u_{i}') for i in range(deg_diff)]
+c = [var(f'c_{i}') for i in range(100)]
+e = [var(f'e')]
+v = e + u 
+
+H = PolynomialRing(QQ, c)
+L = PolynomialRing(H, v)
+
+c = L.base_ring().gens()
+v = L.gens()
+
+h = L((v[1]**3)/6 + v[0]**2/24*v[1]*v[3] + v[0]**4/1152 * v[5])   
+g_initial = L(v[1])
+
+start = time.time()
+def total_recursion_rel(h, g_initial, v, c, deg_diff, iteration_number):
+    g = []
+    g_coef = []
+    
+    for i in range(iteration_number):
+        old_poly = bracket(g_initial, h, deg_diff)
+        new_poly = L(reconstruct_polynomial(old_poly, v, c, deg_diff))
+        show(new_poly)
+        g_coef.append(new_poly)
+        g_i = groebner_basis(h, g_initial, new_poly, v, c, deg_diff) 
+        show(g_i)
+        g.append(g_i)
+        
+        # Update for the next iteration
+        g_initial = g_i
+
+    return g, g_coef
+
+g, g_coef = total_recursion_rel(h, g_initial, v, c, deg_diff, 7)
+
+end = time.time()
+print(end - start)
